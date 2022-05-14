@@ -13,7 +13,9 @@
  */
 package io.trino.execution.executor;
 
+import com.google.common.base.Ticker;
 import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
 import io.airlift.testing.TestingTicker;
@@ -38,6 +40,7 @@ import static io.airlift.testing.Assertions.assertGreaterThan;
 import static io.airlift.testing.Assertions.assertLessThan;
 import static io.trino.execution.executor.MultilevelSplitQueue.LEVEL_CONTRIBUTION_CAP;
 import static io.trino.execution.executor.MultilevelSplitQueue.LEVEL_THRESHOLD_SECONDS;
+import static io.trino.version.EmbedVersion.testingVersionEmbedder;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -491,6 +494,39 @@ public class TestTaskExecutor
         }
     }
 
+    @Test
+    public void testTaskExecutorRunawaySplitInterrupt()
+            throws Exception
+    {
+        TaskExecutor taskExecutor = new TaskExecutor(
+                8,
+                16,
+                3,
+                4,
+                testingVersionEmbedder(),
+                new Duration(1, SECONDS),
+                elements -> elements.stream().anyMatch(element -> element.getFileName().equals("TestTaskExecutor.java")),
+                new Duration(1, SECONDS),
+                new MultilevelSplitQueue(2),
+                Ticker.systemTicker());
+        taskExecutor.start();
+
+        try {
+            TaskId taskId = new TaskId(new StageId("foo", 0), 0, 0);
+            TaskHandle taskHandle = taskExecutor.addTask(
+                    taskId, () -> 1.0,
+                    1,
+                    new Duration(1, SECONDS),
+                    OptionalInt.of(1));
+            MockSplitRunner mockSplitRunner = new MockSplitRunner();
+            taskExecutor.enqueueSplits(taskHandle, false, ImmutableList.of(mockSplitRunner));
+            mockSplitRunner.interrupted.get(60, SECONDS);
+        }
+        finally {
+            taskExecutor.stop();
+        }
+    }
+
     private void assertSplitStates(int endIndex, TestingJob[] splits)
     {
         // assert that splits up to and including endIndex are all started
@@ -514,6 +550,44 @@ public class TestTaskExecutor
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    private static class MockSplitRunner
+            implements SplitRunner
+    {
+        private SettableFuture<Boolean> interrupted = SettableFuture.create();
+
+        @Override
+        public boolean isFinished()
+        {
+            return interrupted.isDone();
+        }
+
+        @Override
+        public ListenableFuture<Void> processFor(Duration duration)
+        {
+            while (true) {
+                try {
+                    Thread.sleep(1);
+                }
+                catch (InterruptedException e) {
+                    break;
+                }
+            }
+            interrupted.set(true);
+            return immediateVoidFuture();
+        }
+
+        @Override
+        public String getInfo()
+        {
+            return "";
+        }
+
+        @Override
+        public void close()
+        {
         }
     }
 

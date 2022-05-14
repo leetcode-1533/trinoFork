@@ -65,7 +65,8 @@ public class TestTaskManagerConfig
                 .setTaskNotificationThreads(5)
                 .setTaskYieldThreads(3)
                 .setLevelTimeMultiplier(new BigDecimal("2"))
-                .setStatisticsCpuTimerEnabled(true));
+                .setStatisticsCpuTimerEnabled(true)
+                .setInterruptRunawaySplitsTimeout(new Duration(600, TimeUnit.SECONDS)));
     }
 
     @Test
@@ -101,6 +102,7 @@ public class TestTaskManagerConfig
                 .put("task.task-yield-threads", "8")
                 .put("task.level-time-multiplier", "2.1")
                 .put("task.statistics-cpu-timer-enabled", "false")
+                .put("task.interrupt-runaway-splits-timeout", "599s")
                 .buildOrThrow();
 
         TaskManagerConfig expected = new TaskManagerConfig()
@@ -131,6 +133,7 @@ public class TestTaskManagerConfig
                 .setTaskNotificationThreads(13)
                 .setTaskYieldThreads(8)
                 .setLevelTimeMultiplier(new BigDecimal("2.1"))
+                .setInterruptRunawaySplitsTimeout(new Duration(599, TimeUnit.SECONDS))
                 .setStatisticsCpuTimerEnabled(false);
 
         assertFullMapping(properties, expected);

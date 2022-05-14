@@ -124,3 +124,14 @@ of additional CPU for parallel writes. Some connectors can be bottlenecked on CP
 writing due to compression or other factors. Setting this too high may cause the cluster
 to become overloaded due to excessive resource utilization. This can also be specified on
 a per-query basis using the ``task_writer_count`` session property.
+
+``task.interrupt-runaway-splits-timeout``
+^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``duration``
+* **Minimum value:** ``1s``
+* **Default value:** ``10m``
+
+Timeout for interrupting split threads blocked without yielding control.
+Only threads blocked in specific locations are interrupted. Currently this is just threads
+blocked in the Joni regular expression library.

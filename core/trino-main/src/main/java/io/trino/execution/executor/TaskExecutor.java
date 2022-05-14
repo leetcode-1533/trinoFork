@@ -27,8 +27,10 @@ import io.airlift.units.Duration;
 import io.trino.execution.SplitRunner;
 import io.trino.execution.TaskId;
 import io.trino.execution.TaskManagerConfig;
+import io.trino.operator.scalar.JoniRegexpFunctions;
 import io.trino.spi.TrinoException;
 import io.trino.spi.VersionEmbedder;
+import java.util.function.Predicate;
 import org.weakref.jmx.Managed;
 import org.weakref.jmx.Nested;
 
@@ -69,11 +71,15 @@ import static io.trino.execution.executor.MultilevelSplitQueue.computeLevel;
 import static io.trino.version.EmbedVersion.testingVersionEmbedder;
 import static java.lang.Math.min;
 import static java.lang.String.format;
+import static java.lang.System.lineSeparator;
+import static java.util.Arrays.asList;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
 import static java.util.concurrent.TimeUnit.MICROSECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static java.util.stream.Collectors.joining;
+
 
 @ThreadSafe
 public class TaskExecutor
@@ -82,7 +88,10 @@ public class TaskExecutor
 
     // print out split call stack if it has been running for a certain amount of time
     private static final Duration LONG_SPLIT_WARNING_THRESHOLD = new Duration(600, TimeUnit.SECONDS);
-
+    private static final Predicate<List<StackTraceElement>> DEFAULT_INTERRUPTIBLE_SPLIT_PREDICATE =
+            elements -> elements.stream().anyMatch(element -> element.getClassName().equals(JoniRegexpFunctions.class.getName()));
+    // checking frequency for long-running splits
+    private static final Duration DEFAULT_INTERRUPT_SPLIT_INTERVAL = new Duration(60, TimeUnit.SECONDS);
     private static final AtomicLong NEXT_RUNNER_ID = new AtomicLong();
 
     private final ExecutorService executor;
@@ -95,6 +104,10 @@ public class TaskExecutor
     private final VersionEmbedder versionEmbedder;
 
     private final Ticker ticker;
+
+    private final Duration interruptRunawaySplitsTimeout;
+    private final Predicate<List<StackTraceElement>> interruptibleSplitPredicate;
+    private final Duration interruptSplitInterval;
 
     private final ScheduledExecutorService splitMonitorExecutor = newSingleThreadScheduledExecutor(daemonThreadsNamed("TaskExecutor"));
     private final SortedSet<RunningSplitInfo> runningSplitInfos = new ConcurrentSkipListSet<>();
@@ -164,6 +177,9 @@ public class TaskExecutor
                 config.getMinDriversPerTask(),
                 config.getMaxDriversPerTask(),
                 versionEmbedder,
+                config.getInterruptRunawaySplitsTimeout(),
+                DEFAULT_INTERRUPTIBLE_SPLIT_PREDICATE,
+                DEFAULT_INTERRUPT_SPLIT_INTERVAL,
                 splitQueue,
                 Ticker.systemTicker());
     }
@@ -171,13 +187,15 @@ public class TaskExecutor
     @VisibleForTesting
     public TaskExecutor(int runnerThreads, int minDrivers, int guaranteedNumberOfDriversPerTask, int maximumNumberOfDriversPerTask, Ticker ticker)
     {
-        this(runnerThreads, minDrivers, guaranteedNumberOfDriversPerTask, maximumNumberOfDriversPerTask, testingVersionEmbedder(), new MultilevelSplitQueue(2), ticker);
+        this(runnerThreads, minDrivers, guaranteedNumberOfDriversPerTask, maximumNumberOfDriversPerTask, testingVersionEmbedder(),
+                new TaskManagerConfig().getInterruptRunawaySplitsTimeout(),  DEFAULT_INTERRUPTIBLE_SPLIT_PREDICATE, DEFAULT_INTERRUPT_SPLIT_INTERVAL, new MultilevelSplitQueue(2), ticker);
     }
 
     @VisibleForTesting
     public TaskExecutor(int runnerThreads, int minDrivers, int guaranteedNumberOfDriversPerTask, int maximumNumberOfDriversPerTask, MultilevelSplitQueue splitQueue, Ticker ticker)
     {
-        this(runnerThreads, minDrivers, guaranteedNumberOfDriversPerTask, maximumNumberOfDriversPerTask, testingVersionEmbedder(), splitQueue, ticker);
+        this(runnerThreads, minDrivers, guaranteedNumberOfDriversPerTask, maximumNumberOfDriversPerTask, testingVersionEmbedder(),
+                new TaskManagerConfig().getInterruptRunawaySplitsTimeout(), DEFAULT_INTERRUPTIBLE_SPLIT_PREDICATE, DEFAULT_INTERRUPT_SPLIT_INTERVAL, splitQueue, ticker);
     }
 
     @VisibleForTesting
@@ -187,6 +205,9 @@ public class TaskExecutor
             int guaranteedNumberOfDriversPerTask,
             int maximumNumberOfDriversPerTask,
             VersionEmbedder versionEmbedder,
+            Duration interruptRunawaySplitsTimeout,
+            Predicate<List<StackTraceElement>> interruptibleSplitPredicate,
+            Duration interruptSplitInterval,
             MultilevelSplitQueue splitQueue,
             Ticker ticker)
     {
@@ -194,12 +215,18 @@ public class TaskExecutor
         checkArgument(guaranteedNumberOfDriversPerTask > 0, "guaranteedNumberOfDriversPerTask must be at least 1");
         checkArgument(maximumNumberOfDriversPerTask > 0, "maximumNumberOfDriversPerTask must be at least 1");
         checkArgument(guaranteedNumberOfDriversPerTask <= maximumNumberOfDriversPerTask, "guaranteedNumberOfDriversPerTask cannot be greater than maximumNumberOfDriversPerTask");
+        checkArgument(interruptRunawaySplitsTimeout.getValue(TimeUnit.SECONDS) >= 1.0, "interruptRunawaySplitsTimeout must be at least 1 second");
 
         // we manage thread pool size directly, so create an unlimited pool
         this.executor = newCachedThreadPool(threadsNamed("task-processor-%s"));
         this.executorMBean = new ThreadPoolExecutorMBean((ThreadPoolExecutor) executor);
         this.runnerThreads = runnerThreads;
+
         this.versionEmbedder = requireNonNull(versionEmbedder, "versionEmbedder is null");
+
+        this.interruptRunawaySplitsTimeout = interruptRunawaySplitsTimeout;
+        this.interruptibleSplitPredicate = interruptibleSplitPredicate;
+        this.interruptSplitInterval = interruptSplitInterval;
 
         this.ticker = requireNonNull(ticker, "ticker is null");
 
@@ -216,6 +243,10 @@ public class TaskExecutor
         checkState(!closed, "TaskExecutor is closed");
         for (int i = 0; i < runnerThreads; i++) {
             addRunnerThread();
+        }
+        if (interruptRunawaySplitsTimeout != null) {
+            long interval = (long) interruptSplitInterval.getValue(TimeUnit.SECONDS);
+            splitMonitorExecutor.scheduleAtFixedRate(this::interruptRunawaySplits, interval, interval, TimeUnit.SECONDS);
         }
     }
 
@@ -457,6 +488,38 @@ public class TaskExecutor
         return null;
     }
 
+    private void interruptRunawaySplits()
+    {
+        for (RunningSplitInfo splitInfo : runningSplitInfos) {
+            Duration duration = Duration.succinctNanos(ticker.read() - splitInfo.getStartTime());
+
+            if (duration.compareTo(interruptRunawaySplitsTimeout) > 0) {
+                List<StackTraceElement> stackTraceElements = asList(splitInfo.getThread().getStackTrace());
+
+                if (!splitInfo.printed) {
+                    splitInfo.setPrinted();
+
+                    String splitThreadStack = toStackString(stackTraceElements);
+                    String splitThreadId = splitInfo.getThreadId();
+                    log.warn(String.format("Split %s has been long running %n%s", splitInfo.getSplitInfo(), splitThreadStack));
+                }
+
+                if (interruptibleSplitPredicate.test(stackTraceElements)) {
+                    log.warn("Interrupting runaway split matching the predicate " + splitInfo.getSplitInfo());
+                    splitInfo.getThread().interrupt();
+                }
+            }
+        }
+    }
+
+    private String toStackString(List<StackTraceElement> stackTraceElements) {
+        String stackString = stackTraceElements.stream()
+                .map(Object::toString)
+                .collect(joining(lineSeparator()));
+
+        return stackString;
+    }
+
     private class TaskRunner
             implements Runnable
     {
@@ -479,7 +542,7 @@ public class TaskExecutor
 
                     String threadId = split.getTaskHandle().getTaskId() + "-" + split.getSplitId();
                     try (SetThreadName splitName = new SetThreadName(threadId)) {
-                        RunningSplitInfo splitInfo = new RunningSplitInfo(ticker.read(), threadId, Thread.currentThread());
+                        RunningSplitInfo splitInfo = new RunningSplitInfo(ticker.read(), threadId, Thread.currentThread(), split);
                         runningSplitInfos.add(splitInfo);
                         runningSplits.add(split);
 
@@ -840,13 +903,15 @@ public class TaskExecutor
         private final long startTime;
         private final String threadId;
         private final Thread thread;
+        private final PrioritizedSplitRunner split;
         private boolean printed;
 
-        public RunningSplitInfo(long startTime, String threadId, Thread thread)
+        public RunningSplitInfo(long startTime, String threadId, Thread thread, PrioritizedSplitRunner split)
         {
             this.startTime = startTime;
             this.threadId = threadId;
             this.thread = thread;
+            this.split = split;
             this.printed = false;
         }
 
@@ -873,6 +938,11 @@ public class TaskExecutor
         public void setPrinted()
         {
             printed = true;
+        }
+
+        public String getSplitInfo()
+        {
+            return split.getInfo();
         }
 
         @Override

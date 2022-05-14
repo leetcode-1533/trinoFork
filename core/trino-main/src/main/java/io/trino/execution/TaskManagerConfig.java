@@ -69,6 +69,7 @@ public class TaskManagerConfig
 
     private Duration statusRefreshMaxWait = new Duration(1, TimeUnit.SECONDS);
     private Duration infoUpdateInterval = new Duration(3, TimeUnit.SECONDS);
+    private Duration interruptRunawaySplitsTimeout = new Duration(600, TimeUnit.SECONDS);
 
     private int writerCount = 1;
     // cap task concurrency to 32 in order to avoid small pages produced by local partitioning exchanges
@@ -461,6 +462,20 @@ public class TaskManagerConfig
     public TaskManagerConfig setTaskYieldThreads(int taskYieldThreads)
     {
         this.taskYieldThreads = taskYieldThreads;
+        return this;
+    }
+
+    @MinDuration("1s")
+    public Duration getInterruptRunawaySplitsTimeout()
+    {
+        return interruptRunawaySplitsTimeout;
+    }
+
+    @Config("task.interrupt-runaway-splits-timeout")
+    @ConfigDescription("Interrupt runaway split threads after this timeout if the task is stuck in certain allow listed places")
+    public TaskManagerConfig setInterruptRunawaySplitsTimeout(Duration interruptRunawaySplitsTimeout)
+    {
+        this.interruptRunawaySplitsTimeout = interruptRunawaySplitsTimeout;
         return this;
     }
 }
