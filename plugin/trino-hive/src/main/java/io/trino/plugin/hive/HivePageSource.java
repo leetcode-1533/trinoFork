@@ -14,6 +14,7 @@
 package io.trino.plugin.hive;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import io.trino.plugin.hive.HivePageSourceProvider.BucketAdaptation;
 import io.trino.plugin.hive.HivePageSourceProvider.ColumnMapping;
 import io.trino.plugin.hive.coercions.DoubleToFloatCoercer;
@@ -48,6 +49,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.typeinfo.ListTypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.MapTypeInfo;
+import org.apache.hadoop.hive.serde2.typeinfo.StructTypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 
 import javax.annotation.Nullable;
@@ -56,6 +58,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.function.Function;
@@ -93,6 +96,7 @@ import static io.trino.spi.block.ColumnarRow.toColumnarRow;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.RealType.REAL;
 import static java.lang.String.format;
+import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 
 public class HivePageSource
@@ -455,17 +459,30 @@ public class HivePageSource
             requireNonNull(typeManager, "typeManager is null");
             requireNonNull(fromHiveType, "fromHiveType is null");
             requireNonNull(toHiveType, "toHiveType is null");
+
+            List<String> fromFieldNames = ((StructTypeInfo) fromHiveType.getTypeInfo()).getAllStructFieldNames();
+            List<String> toFieldNames = ((StructTypeInfo) toHiveType.getTypeInfo()).getAllStructFieldNames();
             List<HiveType> fromFieldTypes = extractStructFieldTypes(fromHiveType);
             List<HiveType> toFieldTypes = extractStructFieldTypes(toHiveType);
+
+            ImmutableMap.Builder<String, Integer> fromHiveTypeNameIndexBuilder = ImmutableMap.builder();
+            for (int i = 0; i < fromFieldNames.size(); i++) {
+                fromHiveTypeNameIndexBuilder.put(fromFieldNames.get(i).toLowerCase(ENGLISH), i);
+            }
+            Map<String, Integer> fromHiveTypeNameIndexes = fromHiveTypeNameIndexBuilder.buildOrThrow();
             ImmutableList.Builder<Optional<Function<Block, Block>>> coercers = ImmutableList.builder();
             this.nullBlocks = new Block[toFieldTypes.size()];
+
             for (int i = 0; i < toFieldTypes.size(); i++) {
-                if (i >= fromFieldTypes.size()) {
+                String coerceFieldName = toFieldNames.get(i).toLowerCase(ENGLISH);
+                Integer fromHiveTypeNameIndex = fromHiveTypeNameIndexes.get(coerceFieldName);
+
+                if (fromHiveTypeNameIndex == null) {
                     nullBlocks[i] = toFieldTypes.get(i).getType(typeManager).createBlockBuilder(null, 1).appendNull().build();
                     coercers.add(Optional.empty());
                 }
                 else {
-                    coercers.add(createCoercer(typeManager, fromFieldTypes.get(i), toFieldTypes.get(i)));
+                    coercers.add(createCoercer(typeManager, fromFieldTypes.get(fromHiveTypeNameIndex), toFieldTypes.get(i)));
                 }
             }
             this.coercers = coercers.build();
@@ -477,16 +494,18 @@ public class HivePageSource
             ColumnarRow rowBlock = toColumnarRow(block);
             Block[] fields = new Block[coercers.size()];
             int[] ids = new int[rowBlock.getField(0).getPositionCount()];
-            for (int i = 0; i < coercers.size(); i++) {
+
+            for (int i = 0, nullCount = 0; i < coercers.size(); i++) {
                 Optional<Function<Block, Block>> coercer = coercers.get(i);
                 if (coercer.isPresent()) {
-                    fields[i] = coercer.get().apply(rowBlock.getField(i));
+                    fields[i] = coercer.get().apply(rowBlock.getField(i-nullCount));
                 }
-                else if (i < rowBlock.getFieldCount()) {
-                    fields[i] = rowBlock.getField(i);
+                else if (nullBlocks[i] != null) {
+                    fields[i] = DictionaryBlock.create(ids.length, nullBlocks[i], ids);
+                    nullCount++;
                 }
                 else {
-                    fields[i] = DictionaryBlock.create(ids.length, nullBlocks[i], ids);
+                    fields[i] = rowBlock.getField(i-nullCount);
                 }
             }
             boolean[] valueIsNull = null;

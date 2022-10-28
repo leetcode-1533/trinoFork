@@ -215,6 +215,46 @@ public class TestHiveSparkCompatibility
     }
 
     @Test(groups = {HIVE_SPARK, PROFILE_SPECIFIC_TESTS})
+    public void testSparkParquetBloomFilterCompatibility()
+    {
+        String sparkTableNameWithBloomFilter = "test_spark_parquet_bloom_filter_compatibility_enabled_" + randomTableSuffix();
+        String sparkTableNameNoBloomFilter = "test_spark_parquet_bloom_filter_compatibility_disabled_" + randomTableSuffix();
+        onSpark().executeQuery(
+                "CREATE TABLE " + sparkTableNameWithBloomFilter + "(id INT, name STRING, age INT) USING PARQUET " +
+                        "OPTIONS (" +
+                        "'parquet.bloom.filter.enabled'='true'," +
+                        "'parquet.bloom.filter.enabled#age'='false'" +
+                        ")");
+        onSpark().executeQuery(
+                "CREATE TABLE " + sparkTableNameNoBloomFilter + "(id INT, name STRING, age INT) USING PARQUET " +
+                        "OPTIONS (" +
+                        "'parquet.bloom.filter.enabled'='false'" +
+                        ")");
+        String[] sparkTables = new String[] {sparkTableNameWithBloomFilter, sparkTableNameNoBloomFilter};
+        String[] trinoTables = new String[] {
+                format("%s.default.%s", TRINO_CATALOG, sparkTableNameWithBloomFilter),
+                format("%s.default.%s", TRINO_CATALOG, sparkTableNameNoBloomFilter)};
+
+        for (String sparkTable : sparkTables) {
+            onSpark().executeQuery("INSERT INTO " + sparkTable + " VALUES (3212, 'name1', 55)");
+            onSpark().executeQuery("INSERT INTO " + sparkTable + " VALUES (2131, 'iddd1', 98)");
+            onSpark().executeQuery("INSERT INTO " + sparkTable + " VALUES (9988, 'vvvv', -1)");
+        }
+//        todo: enable/disable trino using parquet bloomfilter
+        for (String trinoTable : trinoTables) {
+            assertThat(onTrino().executeQuery("SELECT id, name, age FROM " + trinoTable))
+                    .containsOnly(List.of(
+                            row(3212, "name1", 55),
+                            row(2131, "iddd1", 98),
+                            row(9988, "vvvv", -1)));
+        }
+
+        for (String sparkTable : sparkTables) {
+            onSpark().executeQuery("DROP TABLE " + sparkTable);
+        }
+    }
+
+    @Test(groups = {HIVE_SPARK, PROFILE_SPECIFIC_TESTS})
     public void testInsertFailsOnBucketedTableCreatedBySpark()
     {
         String hiveTableName = "spark_insert_bucketed_table_" + randomTableSuffix();
@@ -262,7 +302,17 @@ public class TestHiveSparkCompatibility
         onSpark().executeQuery("DROP TABLE " + hiveTableName);
     }
 
-    private static final String[] HIVE_TIMESTAMP_PRECISIONS = new String[]{"MILLISECONDS", "MICROSECONDS", "NANOSECONDS"};
+    private static final String[] HIVE_TIMESTAMP_PRECISIONS = new String[] {"MILLISECONDS", "MICROSECONDS", "NANOSECONDS"};
+
+    @DataProvider
+    public static Object[][] sparkParquetBloomFilter()
+    {
+        return new Object[][] {
+                {3232, "iinnm", 12},
+                {8776, "name2", 21},
+                {2131, "abcde", -1},
+        };
+    }
 
     @DataProvider
     public static Object[][] sparkParquetTimestampFormats()
@@ -273,10 +323,10 @@ public class TestHiveSparkCompatibility
 
         // Ordering of expected values matches the ordering in HIVE_TIMESTAMP_PRECISIONS
         return new Object[][] {
-                {"TIMESTAMP_MILLIS", millisTimestamp, new String[]{millisTimestamp, millisTimestamp, millisTimestamp}},
-                {"TIMESTAMP_MICROS", microsTimestamp, new String[]{millisTimestamp, microsTimestamp, microsTimestamp}},
+                {"TIMESTAMP_MILLIS", millisTimestamp, new String[] {millisTimestamp, millisTimestamp, millisTimestamp}},
+                {"TIMESTAMP_MICROS", microsTimestamp, new String[] {millisTimestamp, microsTimestamp, microsTimestamp}},
                 // note that Spark timestamp has microsecond precision
-                {"INT96", nanosTimestamp, new String[]{millisTimestamp, microsTimestamp, microsTimestamp}},
+                {"INT96", nanosTimestamp, new String[] {millisTimestamp, microsTimestamp, microsTimestamp}},
         };
     }
 
